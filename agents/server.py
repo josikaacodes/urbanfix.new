@@ -9,6 +9,7 @@ Endpoints
 """
 from __future__ import annotations
 
+import threading
 import time
 
 from fastapi import FastAPI, HTTPException
@@ -17,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from .config import DEPARTMENTS, DEPARTMENT_KEYS, FREE_MODELS, GROQ_API_KEY, LAYA_DIR
 from .graph import run_ticket
-from .laya_labeler import get_laya_agent, label_ticket
+from .laya_labeler import get_laya_agent, label_ticket, multilingual_loaded
 
 app = FastAPI(title="UrbanFix Agent API", version="1.0.0")
 
@@ -38,8 +39,17 @@ class TicketRequest(BaseModel):
 
 @app.on_event("startup")
 def warm_laya() -> None:
-    """Load the 803 MB checkpoint once at boot so the first request is not slow."""
+    """Load the English checkpoint once at boot, then the multilingual one in the background
+    so a Tamil/Hindi ticket does not pay the model-load cost on its first request."""
     get_laya_agent()
+
+    def _warm_multi() -> None:
+        try:
+            get_laya_agent(multilingual=True)
+        except Exception:
+            pass  # multilingual stays optional; label_ticket falls back on its own
+
+    threading.Thread(target=_warm_multi, daemon=True, name="warm-multilingual").start()
 
 
 @app.get("/api/health")
@@ -47,7 +57,11 @@ def health() -> dict:
     agent = get_laya_agent()
     return {
         "ok": True,
-        "laya": {"loaded": agent is not None, "dir": str(LAYA_DIR)},
+        "laya": {
+            "loaded": agent is not None,
+            "multilingual": multilingual_loaded(),
+            "dir": str(LAYA_DIR),
+        },
         "groq_key_set": bool(GROQ_API_KEY),
         "free_models": FREE_MODELS,
         "departments": DEPARTMENT_KEYS,

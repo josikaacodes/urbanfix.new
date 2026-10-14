@@ -62,6 +62,15 @@ Rules applied after inference:
 - `urgent >= 0.7` **escalates to P1** even if severity said P2
 - any exception (torch missing, bad weights) → **keyword fallback labeller**, graph never breaks
 
+**Checkpoint selection is script-aware.** `./laya` holds three vendored checkpoints — English at
+the repo root, plus `multilingual/` (614 MB) and `typed-decisions/`. A ticket written in a
+non-Latin script (Tamil, Hindi, Arabic, ...) is labelled by the **multilingual** checkpoint,
+because the English one is unreliable outside Latin script (per Laya's own README); Latin-script
+tickets use the root checkpoint. The multilingual weights load lazily and are warmed in a
+background thread at server boot, so the first Tamil ticket does not pay the load cost. Which
+checkpoint answered is exposed in `labels.source` — `laya` / `laya-multilingual` /
+`keyword-fallback` — and rendered as a chip in the GovDesk UI.
+
 ### Layer 3 — `main_answer` (the main agent speaks last)
 
 Receives the raw ticket + Laya labels + the sub-agent work order, and issues the final answer.
@@ -184,6 +193,7 @@ Keys live in `.env` (gitignored): `GROQ_API_KEY`, `MISTRAL_API_KEY`.
 | `agents/sub_agents.py` | 4 domain prompts, provider chain, JSON repair | |
 | `src/services/triageApi.ts` | typed frontend client | every call optional — UI degrades to keyword inference if the API is down |
 | `agents/dashboard.py` | Streamlit sim dashboard, `:8501` | live API **or** in-process mode, pipeline DAG, probability chart, 4 tabs, history |
+| `serve_urbanfix_ui.py` (in `~/Downloads`) | single-file static server for the standalone **GovDesk** prototype, `:8090` | serves only `urbanfix_ai_platform.html`; the page calls `/api/label` live while typing and `/api/triage` on submit |
 | `agents/cli.py` / `check.py` | terminal runner / 4-route smoke test | `python -m agents.check` |
 
 ```bash
@@ -192,6 +202,7 @@ npm.cmd run dev                 # :3000
 npm.cmd run agents:dashboard    # :8501
 npm.cmd run agents:check        # verify all 4 routes
 python -m agents.cli "deep pothole on Avenue Road" --json
+python "C:\Users\surya prakash\Downloads\serve_urbanfix_ui.py"   # :8090 GovDesk prototype UI
 ```
 
 ---

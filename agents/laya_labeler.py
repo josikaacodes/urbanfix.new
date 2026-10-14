@@ -12,6 +12,7 @@ labeller is used so the graph never breaks.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass, asdict
@@ -87,10 +88,61 @@ def build_questions() -> dict:
 # --------------------------------------------------------------------------- inference
 _agent = None
 _agent_error: str | None = None
+_agent_multi = None
+_agent_multi_error: str | None = None
+
+# Non-Latin scripts (Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu,
+# Kannada, Malayalam, Arabic, Thai, ...) -> use the vendored multilingual checkpoint.
+_NON_LATIN = re.compile(
+    "[\u0900-\u097F\u0980-\u09FF\u0A00-\u0A7F\u0B00-\u0B7F\u0B80-\u0BFF"
+    "\u0C00-\u0C7F\u0C80-\u0CFF\u0D00-\u0D7F\u0600-\u06FF\u0E00-\u0E7F]"
+)
 
 
-def get_laya_agent():
-    """Load the vendored checkpoint once (offline). Returns None + sets _agent_error on failure."""
+def needs_multilingual(text: str) -> bool:
+    """True when the ticket is written in a non-Latin script (Tamil, Hindi, ...)."""
+    return bool(_NON_LATIN.search(text or ""))
+
+
+def multilingual_loaded() -> bool:
+    """Non-blocking status probe for /api/health (never triggers a load)."""
+    return _agent_multi is not None
+
+
+def _load_checkpoint(model_dir: Path):
+    # rl_agent_api.py / rl_common.py live only in the root laya/ folder; the sub-checkpoints
+    # (multilingual/, typed-decisions/) carry weights + config only, so the root must be on
+    # sys.path for the bare `rl_agent_api` import regardless of which weights we load.
+    root = str(LAYA_DIR)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    target = str(model_dir)
+    if target not in sys.path:
+        sys.path.insert(0, target)
+
+    from rl_agent_api import RLAgent  # type: ignore
+
+    return RLAgent(model_dir=target, device=LAYA_DEVICE)
+
+
+def get_laya_agent(multilingual: bool = False):
+    """Load a vendored checkpoint once (offline). Returns None + sets *_error on failure."""
+    if multilingual:
+        global _agent_multi, _agent_multi_error
+        if _agent_multi is not None or _agent_multi_error is not None:
+            return _agent_multi
+        try:
+            mdir = LAYA_DIR / "multilingual"
+            if not LAYA_DIR.exists():
+                raise FileNotFoundError(f"Laya directory not found: {LAYA_DIR}")
+            if not (mdir / "model.safetensors").exists():
+                raise FileNotFoundError(f"multilingual checkpoint not found: {mdir}")
+            _agent_multi = _load_checkpoint(mdir)
+        except Exception as exc:
+            _agent_multi_error = f"{type(exc).__name__}: {exc}"
+            _agent_multi = None
+        return _agent_multi
+
     global _agent, _agent_error
     if _agent is not None or _agent_error is not None:
         return _agent
@@ -98,14 +150,7 @@ def get_laya_agent():
     try:
         if not LAYA_DIR.exists():
             raise FileNotFoundError(f"Laya directory not found: {LAYA_DIR}")
-        # rl_agent_api.py imports rl_common.py by bare module name.
-        laya_path = str(LAYA_DIR)
-        if laya_path not in sys.path:
-            sys.path.insert(0, laya_path)
-
-        from rl_agent_api import RLAgent  # type: ignore
-
-        _agent = RLAgent(model_dir=laya_path, device=LAYA_DEVICE)
+        _agent = _load_checkpoint(LAYA_DIR)
     except Exception as exc:  # torch/transformers missing, bad weights, etc.
         _agent_error = f"{type(exc).__name__}: {exc}"
         _agent = None
@@ -166,7 +211,10 @@ def label_ticket(text: str) -> Labels:
     if not text:
         raise ValueError("Empty ticket text - nothing to label.")
 
-    agent = get_laya_agent()
+    # Non-Latin script (Tamil/Hindi/...) -> multilingual checkpoint, English one otherwise.
+    multi = needs_multilingual(text)
+    agent = get_laya_agent(multilingual=multi)
+    source = "laya-multilingual" if multi else "laya"
     if agent is None:
         return keyword_label(text)
 
@@ -194,7 +242,7 @@ def label_ticket(text: str) -> Labels:
         if urgent >= 0.7 and priority != "P1":
             priority = "P1"
 
-        return _assemble(text, dept, probs, sev, priority, urgent, ms, "laya")
+        return _assemble(text, dept, probs, sev, priority, urgent, ms, source)
     except Exception:
         # Keep the pipeline alive: Laya is a label source, never a single point of failure.
         return keyword_label(text)

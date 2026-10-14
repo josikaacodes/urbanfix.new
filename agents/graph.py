@@ -19,7 +19,7 @@ from typing import Annotated, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from .config import DEPARTMENTS, DEPARTMENT_KEYS, FREE_MODELS, GROQ_API_KEY, GROQ_BASE_URL, sla_for
-from .laya_labeler import Labels, label_ticket
+from .laya_labeler import Labels, label_ticket, needs_multilingual
 from .sub_agents import chat_json
 
 
@@ -89,6 +89,42 @@ FINAL_SYSTEM = (
 )
 
 
+def _match_reply_language(ticket: str, reply: str) -> str:
+    """Deterministic language guard for `citizen_reply`.
+
+    The LLM occasionally answers an English ticket in Tamil (and vice versa), even though the
+    prompt says to mirror the ticket's language. The reply is what the citizen actually reads,
+    so enforce the rule here: one cheap re-ask, and if that still mismatches an English ticket
+    gets an empty reply rather than one in a language the citizen did not write in.
+    """
+    if not reply:
+        return reply
+    ticket_nonlatin = needs_multilingual(ticket)
+    reply_nonlatin = needs_multilingual(reply)
+    if ticket_nonlatin == reply_nonlatin:
+        return reply
+
+    want = "the same language as the ticket (write it in that script)" if ticket_nonlatin else "English"
+    try:
+        fixed, _, _ = chat_json(
+            "You rewrite civic replies. Answer with ONE JSON object only, no prose: "
+            '{"citizen_reply": "..."}',
+            f"Rewrite the reply below in {want}. Keep it under 40 words, same meaning, "
+            f"warm and plain-language, nothing else.\n\n"
+            f"TICKET:\n{ticket}\n\nREPLY (wrong language):\n{reply}",
+            FREE_MODELS["fast"],
+            max_tokens=300,
+        )
+        text = str(fixed.get("citizen_reply") or "").strip()
+        if text and needs_multilingual(text) == ticket_nonlatin:
+            return text
+    except Exception:
+        pass
+    # Non-Latin ticket: keep the original as a best effort. Latin ticket: drop it rather
+    # than show Tamil text to someone who wrote in English.
+    return reply if ticket_nonlatin else ""
+
+
 def main_answer(state: TicketState) -> dict:
     """Final step: the main agent answers, merging Laya labels with the sub-agent work order."""
     labels = state["labels"]
@@ -122,7 +158,9 @@ def main_answer(state: TicketState) -> dict:
     final["routing_reason"] = final.get("routing_reason") or sub.get("reasoning") or ""
     final["dispatch_brief"] = final.get("dispatch_brief") or ("; ".join(steps) if steps else "")
     final["escalation_notes"] = final.get("escalation_notes") or sub.get("risk_if_delayed") or ""
-    final["citizen_reply"] = final.get("citizen_reply") or sub.get("citizen_reply") or ""
+    final["citizen_reply"] = _match_reply_language(
+        state["text"], final.get("citizen_reply") or sub.get("citizen_reply") or ""
+    )
     final["confidence"] = labels["department_confidence"]
     final["label_source"] = labels["source"]
     final["sub_agent_model"] = sub.get("model")
