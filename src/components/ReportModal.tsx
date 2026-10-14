@@ -1,6 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Ticket, Language, Department } from '../types';
 import { TRANSLATIONS } from '../data/translations';
+import {
+  labelTicket,
+  triageTicket,
+  PRIORITY_TICKET_STYLE,
+  type Priority,
+  type TriageResult,
+} from '../services/triageApi';
 
 interface ReportModalProps {
   isOpen: boolean;
@@ -74,6 +81,31 @@ const PRESET_TEMPLATES = [
   },
 ];
 
+// Defect label shown while only layer-1 (Laya labelling) has run.
+const DEFAULT_DEFECT: Record<Department, string> = {
+  highways: 'Asphalt Defect / Skid Hazard',
+  electric: 'Electrical Luminaire / Arc Hazard',
+  hydro: 'Pipe Rupture / Flow Hazard',
+  sanitation: 'Solid Waste Backlog',
+};
+
+const DEPT_LABEL: Record<Department, string> = {
+  highways: 'GCC Works / Highways',
+  electric: 'TANGEDCO / Electrical Works',
+  hydro: 'CMWSSB / Water & Sewerage',
+  sanitation: 'Zonal Solid Waste Management',
+};
+
+const SLA_BY_DEPT: Record<Department, number> = { highways: 4, electric: 2, hydro: 6, sanitation: 8 };
+
+// Keyword inference used only when the agent API is unreachable.
+const keywordInfer = (text: string): Department => {
+  if (/spark|wire|light|luminaire|electric|shock|cable|transformer|bulb/.test(text)) return 'electric';
+  if (/water|pipe|leak|valve|drain|hydro|sewage|manhole|flood/.test(text)) return 'hydro';
+  if (/trash|garbage|waste|bin|debris|spill|dump|sweep/.test(text)) return 'sanitation';
+  return 'highways';
+};
+
 export const ReportModal: React.FC<ReportModalProps> = ({
   isOpen,
   onClose,
@@ -95,6 +127,9 @@ export const ReportModal: React.FC<ReportModalProps> = ({
   const [defectType, setDefectType] = useState('Public Hazard');
   const [evidencePhoto, setEvidencePhoto] = useState<string>(PRESET_TEMPLATES[0].photo);
   const [photoName, setPhotoName] = useState('IMG_20260925_GNSS.jpg');
+  // Agent API state: layer-1 labelling runs live, the full graph runs on submit.
+  const [aiSource, setAiSource] = useState<'laya' | 'keyword-fallback'>('keyword-fallback');
+  const [aiStatus, setAiStatus] = useState<'idle' | 'labelling' | 'triaging'>('idle');
 
   // Voice recording
   const [isRecording, setIsRecording] = useState(false);
@@ -124,34 +159,44 @@ export const ReportModal: React.FC<ReportModalProps> = ({
     onToast(`Applied preset: ${preset.label}`);
   };
 
-  // Real-time classification inference when description changes
+  // Layer-1 inference: the local Laya labeller via the agent API, debounced so it fires ~1s
+  // after the citizen stops typing. Keyword fallback keeps the UI usable if the API is down.
   useEffect(() => {
-    const text = (description + ' ' + title).toLowerCase();
-    if (text.includes('spark') || text.includes('wire') || text.includes('light') || text.includes('luminaire') || text.includes('electric') || text.includes('shock') || text.includes('cable')) {
-      setSelectedDept('electric');
-      setDeptLabel('TANGEDCO / Electrical Works');
-      setExpectedSla('2 Hours (Live Arc SLA)');
-      setDefectType('Electrical Luminaire / Arc Hazard');
-      setAiConfidence('96.7% Neural Match');
-    } else if (text.includes('water') || text.includes('pipe') || text.includes('leak') || text.includes('valve') || text.includes('drain') || text.includes('hydro') || text.includes('sewage')) {
-      setSelectedDept('hydro');
-      setDeptLabel('CMWSSB / Water & Sewerage');
-      setExpectedSla('6 Hours (Pressurized Main)');
-      setDefectType('Pipe Rupture / Flow Hazard');
-      setAiConfidence('95.4% Neural Match');
-    } else if (text.includes('trash') || text.includes('garbage') || text.includes('waste') || text.includes('bin') || text.includes('debris') || text.includes('spill')) {
-      setSelectedDept('sanitation');
-      setDeptLabel('Zonal Solid Waste Management');
-      setExpectedSla('8 Hours (Sanitation Intake)');
-      setDefectType('Solid Waste Backlog');
-      setAiConfidence('97.3% Neural Match');
-    } else {
-      setSelectedDept('highways');
-      setDeptLabel('GCC Works / Highways');
-      setExpectedSla('4 Hours (Roadway Corridor)');
-      setDefectType('Asphalt Defect / Skid Hazard');
-      setAiConfidence('98.4% Neural Match');
-    }
+    const text = `${description} ${title}`.trim();
+    if (!text) return;
+    let cancelled = false;
+    const handle = setTimeout(async () => {
+      setAiStatus('labelling');
+      try {
+        const labels = await labelTicket(text, { location: locationText });
+        if (cancelled) return;
+        setSelectedDept(labels.department);
+        setDeptLabel(labels.dept_label);
+        setDefectType(DEFAULT_DEFECT[labels.department]);
+        setExpectedSla(`${labels.sla_hours} Hours (${labels.priority} Priority)`);
+        setAiConfidence(
+          `${(labels.department_confidence * 100).toFixed(1)}% ${
+            labels.source === 'laya' ? 'Laya Calibrated' : 'Keyword Match'
+          }`
+        );
+        setAiSource(labels.source);
+      } catch {
+        if (cancelled) return;
+        const dept = keywordInfer(text.toLowerCase());
+        setSelectedDept(dept);
+        setDeptLabel(DEPT_LABEL[dept]);
+        setExpectedSla(`${SLA_BY_DEPT[dept]} Hours (Local Keyword Triage)`);
+        setDefectType(DEFAULT_DEFECT[dept]);
+        setAiConfidence('Keyword Heuristic (API offline)');
+        setAiSource('keyword-fallback');
+      } finally {
+        if (!cancelled) setAiStatus('idle');
+      }
+    }, 900);
+    return () => {
+      cancelled = true;
+      clearTimeout(handle);
+    };
   }, [description, title]);
 
   // Voice recording timer
@@ -240,12 +285,35 @@ export const ReportModal: React.FC<ReportModalProps> = ({
     }
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!description.trim() && !title.trim()) {
       onToast('Please describe the defect or select a preset template.');
       return;
     }
+
+    // Full graph: Laya labels -> main agent routes -> department sub-agent -> main answer.
+    const ticketText = `${title.trim()} ${description.trim()}`.trim();
+    setAiStatus('triaging');
+    onToast('Agent triage running: Laya labelling → main agent → sub-agent dispatch…');
+    let result: TriageResult | null = null;
+    try {
+      result = await triageTicket(ticketText, { location: locationText, coordinates });
+      setSelectedDept(result.department);
+      setDeptLabel(result.deptLabel);
+      setDefectType(result.defectType);
+      setExpectedSla(`${result.slaHours} Hours (${result.priority} Priority)`);
+      setAiConfidence(`${(result.confidence * 100).toFixed(1)}% Laya Calibrated`);
+      setAiSource(result.labelSource);
+    } catch {
+      onToast('Agent API unreachable - docket filed with local keyword triage.');
+    } finally {
+      setAiStatus('idle');
+    }
+
+    const priority: Priority = result?.priority ?? 'P1';
+    const style = PRIORITY_TICKET_STYLE[priority];
+    const slaSeconds = (result?.slaHours ?? 4) * 3600;
 
     const randomId = Math.floor(1000 + Math.random() * 9000);
     const newId = `W42-${randomId}`;
@@ -254,20 +322,22 @@ export const ReportModal: React.FC<ReportModalProps> = ({
     const newTicket: Partial<Ticket> = {
       id: newId,
       docketNumber: newDocketNumber,
-      title: title.trim() || description.slice(0, 50) || 'Reported Civic Defect',
+      title: (result?.title || title.trim() || description.slice(0, 50) || 'Reported Civic Defect').slice(0, 60),
       description: description.trim() || 'Citizen reported public defect via UrbanFix AI Intake Gateway.',
-      department: selectedDept,
-      deptLabel,
+      department: result?.department ?? selectedDept,
+      deptLabel: result?.deptLabel ?? deptLabel,
       location: locationText,
       coordinates,
-      status: 'critical',
-      statusLabel: 'Critical Severity',
-      badgeClass: 'bg-[#ffdbcf] text-[#370e01] border border-[#ffb59c]/50',
+      status: style.status,
+      statusLabel: style.statusLabel,
+      badgeClass: style.badgeClass,
       loggedTimeAgo: 'Logged just now',
-      slaRemainingSeconds: 4 * 3600,
-      initialSlaSeconds: 4 * 3600,
+      slaRemainingSeconds: slaSeconds,
+      initialSlaSeconds: slaSeconds,
       aiConfidence,
       defectType,
+      // Main agent's reply to the citizen, surfaced as the docket quote.
+      quote: result?.citizenReply ? `"${result.citizenReply}"` : undefined,
       evidencePhoto,
       mapCoords: {
         x: Math.floor(140 + Math.random() * 260),
@@ -477,6 +547,25 @@ export const ReportModal: React.FC<ReportModalProps> = ({
                     {t.inferredDept}: {deptLabel}
                   </span>
                   <span className="font-headline font-bold text-[#051c11]">{defectType}</span>
+                  <span
+                    className={`mt-1 inline-block px-1.5 py-0.5 rounded font-mono text-[9px] font-bold uppercase tracking-wide ${
+                      aiStatus === 'triaging'
+                        ? 'bg-[#1a3125] text-[#cee9d7]'
+                        : aiStatus === 'labelling'
+                          ? 'bg-[#d9e8ff] text-[#123a6b]'
+                          : aiSource === 'laya'
+                            ? 'bg-[#c9e4cc] text-[#1a3125]'
+                            : 'bg-[#ece8df] text-[#5b615d]'
+                    }`}
+                  >
+                    {aiStatus === 'triaging'
+                      ? 'main agent → sub-agent…'
+                      : aiStatus === 'labelling'
+                        ? 'laya labelling…'
+                        : aiSource === 'laya'
+                          ? 'laya • calibrated'
+                          : 'keyword • api offline'}
+                  </span>
                 </div>
               </div>
               <div className="text-right">
@@ -576,10 +665,17 @@ export const ReportModal: React.FC<ReportModalProps> = ({
 
             <button
               type="submit"
-              className="px-6 py-2.5 rounded-xl bg-[#1a3125] text-white font-mono text-xs font-semibold hover:bg-[#051c11] shadow-md flex items-center gap-2 transition-all active:scale-[0.98]"
+              disabled={aiStatus === 'triaging'}
+              className="px-6 py-2.5 rounded-xl bg-[#1a3125] text-white font-mono text-xs font-semibold hover:bg-[#051c11] shadow-md flex items-center gap-2 transition-all active:scale-[0.98] disabled:opacity-60 disabled:cursor-wait"
             >
-              <span className="material-symbols-outlined text-[18px]">send</span>
-              <span>Transmit Docket to Ward 42 Dispatch</span>
+              <span className="material-symbols-outlined text-[18px]">
+                {aiStatus === 'triaging' ? 'hourglass_top' : 'send'}
+              </span>
+              <span>
+                {aiStatus === 'triaging'
+                  ? 'Agent triage in progress…'
+                  : 'Transmit Docket to Ward 42 Dispatch'}
+              </span>
             </button>
           </div>
         </form>

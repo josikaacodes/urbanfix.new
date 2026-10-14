@@ -275,14 +275,16 @@ export default function App() {
       deptLabel: newTicketData.deptLabel || 'GCC Works / Highways',
       location: newTicketData.location || 'Ward 42 Sector 4B, Chennai',
       coordinates: newTicketData.coordinates || '13.0827° N, 80.2707° E',
-      status: 'critical',
-      statusLabel: 'Critical Severity',
-      badgeClass: 'bg-[#ffdbcf] text-[#370e01] border border-[#ffb59c]/50',
+      status: newTicketData.status || 'critical',
+      statusLabel: newTicketData.statusLabel || 'Critical Severity',
+      badgeClass: newTicketData.badgeClass || 'bg-[#ffdbcf] text-[#370e01] border border-[#ffb59c]/50',
       loggedTimeAgo: 'Logged just now',
-      slaRemainingSeconds: 4 * 3600,
-      initialSlaSeconds: 4 * 3600,
+      // SLA comes from the agent graph (dept base x priority) when the API answered.
+      slaRemainingSeconds: newTicketData.slaRemainingSeconds ?? 4 * 3600,
+      initialSlaSeconds: newTicketData.initialSlaSeconds ?? 4 * 3600,
       aiConfidence: newTicketData.aiConfidence || '98.2% Neural Match',
       defectType: newTicketData.defectType || 'Public Hazard',
+      quote: newTicketData.quote,
       evidencePhoto:
         newTicketData.evidencePhoto ||
         'https://images.unsplash.com/photo-1544620347-c4fd4a3d5957?auto=format&fit=crop&w=600&q=80',

@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Ticket, CitizenAuditFeedback, Language } from '../types';
+import { Ticket, CitizenAuditFeedback, Language, Department } from '../types';
 import { TRANSLATIONS } from '../data/translations';
 import { CommunityFeedView } from './CommunityFeedView';
+import { labelTicket, triageTicket, PRIORITY_TICKET_STYLE, type TriageResult } from '../services/triageApi';
 
 interface CitizenPortalViewProps {
   tickets: Ticket[];
@@ -51,30 +52,58 @@ export const CitizenPortalView: React.FC<CitizenPortalViewProps> = ({
   const [recordSeconds, setRecordSeconds] = useState(0);
   const recognitionRef = useRef<any>(null);
 
-  // Debounced LLM Pre-Triage Prediction
-  const [inferredDept, setInferredDept] = useState<'highways' | 'electric' | 'hydro' | 'sanitation'>('highways');
+  // Debounced layer-1 prediction: the local Laya labeller via the agent API.
+  const [inferredDept, setInferredDept] = useState<Department>('highways');
   const [inferredDeptLabel, setInferredDeptLabel] = useState('GCC Works / Highways');
   const [expectedSla, setExpectedSla] = useState('4 Hours (Critical Hazard)');
+  const [labelSource, setLabelSource] = useState<'laya' | 'keyword-fallback'>('keyword-fallback');
+  const [triaging, setTriaging] = useState(false);
 
   useEffect(() => {
-    const text = description.toLowerCase();
-    if (text.includes('spark') || text.includes('wire') || text.includes('light') || text.includes('luminaire') || text.includes('electric') || text.includes('shock')) {
-      setInferredDept('electric');
-      setInferredDeptLabel('TANGEDCO / Electrical Works');
-      setExpectedSla('2 Hours (Live Hazard SLA)');
-    } else if (text.includes('water') || text.includes('pipe') || text.includes('leak') || text.includes('valve') || text.includes('drain') || text.includes('hydro')) {
-      setInferredDept('hydro');
-      setInferredDeptLabel('CMWSSB / Water & Sewerage');
-      setExpectedSla('6 Hours (Pressurized Main)');
-    } else if (text.includes('trash') || text.includes('garbage') || text.includes('waste') || text.includes('bin') || text.includes('debris')) {
-      setInferredDept('sanitation');
-      setInferredDeptLabel('Zonal Solid Waste Management');
-      setExpectedSla('12 Hours (Standard Intake)');
-    } else {
-      setInferredDept('highways');
-      setInferredDeptLabel('GCC Works / Highways');
-      setExpectedSla('4 Hours (Corridor Paving)');
-    }
+    const text = description.trim();
+    if (!text) return;
+    let cancelled = false;
+    const handle = setTimeout(async () => {
+      try {
+        const labels = await labelTicket(text, { location: locationText });
+        if (cancelled) return;
+        setInferredDept(labels.department);
+        setInferredDeptLabel(labels.dept_label);
+        setExpectedSla(`${labels.sla_hours} Hours (${labels.priority} Priority)`);
+        setLabelSource(labels.source);
+      } catch {
+        if (cancelled) return;
+        const low = text.toLowerCase();
+        let dept: Department = 'highways';
+        if (/spark|wire|light|luminaire|electric|shock|cable/.test(low)) dept = 'electric';
+        else if (/water|pipe|leak|valve|drain|hydro|sewage/.test(low)) dept = 'hydro';
+        else if (/trash|garbage|waste|bin|debris|spill|dump/.test(low)) dept = 'sanitation';
+        setInferredDept(dept);
+        setInferredDeptLabel(
+          dept === 'electric'
+            ? 'TANGEDCO / Electrical Works'
+            : dept === 'hydro'
+              ? 'CMWSSB / Water & Sewerage'
+              : dept === 'sanitation'
+                ? 'Zonal Solid Waste Management'
+                : 'GCC Works / Highways'
+        );
+        setExpectedSla(
+          dept === 'electric'
+            ? '2 Hours (Live Hazard SLA)'
+            : dept === 'hydro'
+              ? '6 Hours (Pressurized Main)'
+              : dept === 'sanitation'
+                ? '8 Hours (Sanitation Intake)'
+                : '4 Hours (Corridor Paving)'
+        );
+        setLabelSource('keyword-fallback');
+      }
+    }, 900);
+    return () => {
+      cancelled = true;
+      clearTimeout(handle);
+    };
   }, [description]);
 
   // Voice Recording Timer & Web Speech API
@@ -142,12 +171,31 @@ export const CitizenPortalView: React.FC<CitizenPortalViewProps> = ({
   };
 
   // Submit Complaint / Transmit Docket
-  const handleTransmitDocket = (e: React.FormEvent) => {
+  const handleTransmitDocket = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!description.trim()) {
       onToast('Please describe the defect or record a voice note.');
       return;
     }
+
+    // Full graph run before the docket is filed: Laya -> main agent -> sub-agent -> main answer.
+    setTriaging(true);
+    let result: TriageResult | null = null;
+    try {
+      result = await triageTicket(description.trim(), { location: locationText, coordinates });
+      setInferredDept(result.department);
+      setInferredDeptLabel(result.deptLabel);
+      setExpectedSla(`${result.slaHours} Hours (${result.priority} Priority)`);
+      setLabelSource(result.labelSource);
+    } catch {
+      onToast('Agent API unreachable - filing with local keyword triage.');
+    } finally {
+      setTriaging(false);
+    }
+
+    const priority = result?.priority ?? 'P1';
+    const style = PRIORITY_TICKET_STYLE[priority];
+    const slaSeconds = (result?.slaHours ?? 4) * 3600;
 
     const randomNum = Math.floor(1000 + Math.random() * 9000);
     const newDocketNumber = `#W42-2026-${randomNum}`;
@@ -156,20 +204,21 @@ export const CitizenPortalView: React.FC<CitizenPortalViewProps> = ({
     const newTicket: Partial<Ticket> = {
       id: newId,
       docketNumber: newDocketNumber,
-      title: description.slice(0, 56) + (description.length > 56 ? '...' : ''),
+      title: (result?.title || description.slice(0, 56) + (description.length > 56 ? '...' : '')).slice(0, 60),
       description,
-      department: inferredDept,
-      deptLabel: inferredDeptLabel,
+      department: result?.department ?? inferredDept,
+      deptLabel: result?.deptLabel ?? inferredDeptLabel,
       location: locationText,
       coordinates,
-      status: 'critical',
-      statusLabel: 'Critical Severity',
-      badgeClass: 'bg-[#ffdbcf] text-[#370e01] border border-[#ffb59c]/50',
+      status: style.status,
+      statusLabel: style.statusLabel,
+      badgeClass: style.badgeClass,
       loggedTimeAgo: 'Logged just now',
-      slaRemainingSeconds: 4 * 3600,
-      initialSlaSeconds: 4 * 3600,
-      aiConfidence: '98.2% Neural Match',
-      defectType: 'Public Hazard',
+      slaRemainingSeconds: slaSeconds,
+      initialSlaSeconds: slaSeconds,
+      aiConfidence: `${((result?.confidence ?? 0.5) * 100).toFixed(1)}% Laya Calibrated`,
+      defectType: result?.defectType ?? 'Public Hazard',
+      quote: result?.citizenReply ? `"${result.citizenReply}"` : undefined,
       evidencePhoto: attachedPhoto || 'https://images.unsplash.com/photo-1544620347-c4fd4a3d5957?auto=format&fit=crop&w=600&q=80',
       mapCoords: { x: Math.floor(120 + Math.random() * 320), y: Math.floor(100 + Math.random() * 200) },
       lifecycleStage: 'logged',
@@ -498,6 +547,17 @@ export const CitizenPortalView: React.FC<CitizenPortalViewProps> = ({
                     {t.inferredDept}:
                   </span>
                   <span className="font-headline font-bold text-[#051c11]">{inferredDeptLabel}</span>
+                  <span
+                    className={`mt-1 inline-block px-1.5 py-0.5 rounded font-mono text-[9px] font-bold uppercase tracking-wide ${
+                      triaging
+                        ? 'bg-[#1a3125] text-[#cee9d7]'
+                        : labelSource === 'laya'
+                          ? 'bg-[#c9e4cc] text-[#1a3125]'
+                          : 'bg-[#ece8df] text-[#5b615d]'
+                    }`}
+                  >
+                    {triaging ? 'main agent → sub-agent…' : labelSource === 'laya' ? 'laya • calibrated' : 'keyword • api offline'}
+                  </span>
                 </div>
                 <div className="text-right">
                   <span className="text-[10px] font-mono text-[#4e6753] uppercase block font-semibold">
@@ -604,10 +664,13 @@ export const CitizenPortalView: React.FC<CitizenPortalViewProps> = ({
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2.5 rounded-xl bg-[#1a3125] text-white font-mono text-xs font-semibold hover:bg-[#051c11] shadow-xs flex items-center gap-1.5"
+                  disabled={triaging}
+                  className="px-5 py-2.5 rounded-xl bg-[#1a3125] text-white font-mono text-xs font-semibold hover:bg-[#051c11] shadow-xs flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-wait"
                 >
-                  <span className="material-symbols-outlined text-[16px]">send</span>
-                  <span>{t.transmitDocket}</span>
+                  <span className="material-symbols-outlined text-[16px]">
+                    {triaging ? 'hourglass_top' : 'send'}
+                  </span>
+                  <span>{triaging ? 'Agent triage…' : t.transmitDocket}</span>
                 </button>
               </div>
             </div>

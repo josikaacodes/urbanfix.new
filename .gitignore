@@ -14,3 +14,9 @@ laya/
 *.onnx
 .cache/
 *.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
