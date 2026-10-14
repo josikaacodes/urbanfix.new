@@ -9,11 +9,15 @@ coverage/
 
 # Large ML Weights (Laya) & Cache
 laya/
+weights/
 *.safetensors
 *.bin
 *.onnx
 .cache/
 *.db
+
+# Runtime data: filed tickets + citizen photos (PII, never commit)
+agents/storage/
 
 # Python
 __pycache__/

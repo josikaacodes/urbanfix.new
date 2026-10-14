@@ -24,8 +24,12 @@ START ──► main_agent ──► (conditional route by department) ──┐
 | 4 | `hydro_agent` | Water/sewerage work order | `openai/gpt-oss-20b` (Groq free) |
 | 5 | `sanitation_agent` | Solid-waste work order | `openai/gpt-oss-20b` (Groq free) |
 | 6 | `main_answer` (layer 3) | Reconcile labels + work order, issue the final answer | `openai/gpt-oss-120b`, fallback `mistral:ministral-8b-latest` |
+| — | **Vision front-end** (not a graph node) | Photo → editable text draft, then Laya routes it | **Local YOLOv8n** + **Local CLIP ViT-B/32**, `POST /api/vision` |
 
-Only **6 nodes**, **1 router**, **5 LLM/label calls** per ticket (1 local + 2 remote).
+The vision step runs *before* the graph: it only drafts the citizen's description (which the
+citizen may edit), so routing is still 100% Laya's call on the final text.
+
+Only **6 graph nodes**, **1 router**, **5 LLM/label calls** per ticket (1 local + 2 remote).
 
 ---
 
@@ -171,7 +175,9 @@ sla_hours  = base_sla[department] * {"P1": 1, "P2": 2, "P3": 4}[priority]
 |---|---|---|
 | **Groq** | `openai/gpt-oss-120b` (heavy), `openai/gpt-oss-20b` (fast), `qwen/qwen3.8-27b` (available) | primary |
 | **Mistral** | `ministral-8b-latest` (`codestral-latest` also responds) | Groq 429 / truncated JSON |
-| **Local Laya** | vendored checkpoint in `./laya` | every label, always |
+| **Local Laya** | vendored checkpoint in `./laya` (root = Latin script, `multilingual/` = Tamil/Hindi/…) | every label, always |
+| **Local YOLOv8n** | `weights/yolov8n.pt` (6 MB, vendored) | `POST /api/vision` — objects in the photo (bus, person, …) |
+| **Local CLIP ViT-B/32** | `openai/clip-vit-base-patch32` (HF cache, ~600 MB) | `POST /api/vision` — zero-shot defect → department draft |
 
 `chat_json()` walks a provider plan — *Groq primary → Mistral → Groq fallback → Groq primary* —
 with 1.5 s backoff, and retries anything that isn't parseable JSON. Truncated output is repaired
@@ -181,6 +187,21 @@ completion.
 
 Keys live in `.env` (gitignored): `GROQ_API_KEY`, `MISTRAL_API_KEY`.
 
+### Vision: photo → editable text
+
+`agents/vision.py` turns an uploaded photo into a *draft* the citizen edits before submitting:
+
+1. **YOLOv8n** — detects what is in the frame (bus, person, car, dog, …), ignoring the ~60 COCO
+   classes that aren't civic.
+2. **CLIP zero-shot** — scores the photo against 16 civic defect phrases (pothole, sewage from a
+   manhole, fallen live wire, overflowing bin, …), each bound to a department, and returns the
+   best match + a softmax confidence + the top-3.
+3. Both are merged into one editable sentence (`caption`) plus per-engine data.
+
+Both models are lazy-loaded and fully optional — if either is missing the endpoint degrades to
+`ok=False` and the UI asks the citizen to type instead. The **edited** text is what Laya routes
+on, so the photo never overrides the model's judgement. Verified: `yolo+clip`, ~300 ms warm.
+
 ---
 
 ## 6. Serving layer
@@ -188,13 +209,27 @@ Keys live in `.env` (gitignored): `GROQ_API_KEY`, `MISTRAL_API_KEY`.
 | Piece | Where | Notes |
 |---|---|---|
 | `agents/graph.py` | LangGraph `StateGraph`, compiled → `triage_graph` | also callable in-process |
-| `agents/server.py` | FastAPI, `:8010` | `GET /api/health`, `POST /api/label`, `POST /api/triage`; Laya warmed at startup; CORS open for Vite |
-| `agents/laya_labeler.py` | Laya wrapper + keyword fallback | |
-| `agents/sub_agents.py` | 4 domain prompts, provider chain, JSON repair | |
+| `agents/server.py` | FastAPI, `:8010` | `GET /api/health`, `POST /api/label`, `POST /api/triage`, `POST /api/vision`, `GET/POST/PATCH/DELETE /api/tickets`, `GET /api/tickets/{id}/photo`; Laya warmed at startup, YOLO+CLIP lazily; CORS open for Vite |
+| `agents/laya_labeler.py` | Laya wrapper + keyword fallback | script-aware: root vs `multilingual/` checkpoint |
+| `agents/vision.py` | YOLO + CLIP photo→text | lazy, degrades if weights absent |
 | `src/services/triageApi.ts` | typed frontend client | every call optional — UI degrades to keyword inference if the API is down |
 | `agents/dashboard.py` | Streamlit sim dashboard, `:8501` | live API **or** in-process mode, pipeline DAG, probability chart, 4 tabs, history |
-| `serve_urbanfix_ui.py` (in `~/Downloads`) | single-file static server for the standalone **GovDesk** prototype, `:8090` | serves only `urbanfix_ai_platform.html`; the page calls `/api/label` live while typing and `/api/triage` on submit |
+| `serve_urbanfix_ui.py` (in `~/Downloads`) | static server for the two standalone GovDesk prototypes, `:8090` | `/` = `urbanfix_ai_vision.html` (photo→text), `/urbanfix_ai_platform.html` = earlier text-only build |
 | `agents/cli.py` / `check.py` | terminal runner / 4-route smoke test | `python -m agents.check` |
+
+### Ticket handoff (citizen → officer)
+
+Tickets filed through the GovDesk UI are stored **server-side** so the officer really receives
+what the citizen sent — including the photo, which is written to `agents/storage/photos/` and
+served at `/api/tickets/{id}/photo` (the JSON list returns a `photo_url`, never base64):
+
+- `POST /api/tickets` — file with an optional `photo` (data-URL); saved to disk
+- `GET /api/tickets?area=…` — officer's inbox, newest first, area-filtered
+- `GET /api/tickets/{id}/photo` — the actual image bytes the officer views
+- `PATCH /api/tickets/{id}` — dispatch/resolve write-back, so the citizen sees the status flip
+- `DELETE /api/tickets` — demo reset
+
+`agents/storage/` is gitignored (filed tickets + citizen photos are runtime PII, never committed).
 
 ```bash
 npm.cmd run agents:api          # :8010  (Laya warms ~30 s)
